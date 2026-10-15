@@ -19,10 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-Note: this repository contains only the project's own glue scripts (MIT).
-It does NOT bundle any third-party code. s-ui itself (alireza0/s-ui) and the
-Keenetic wrapper s-ui.sh (own-open-source/s-ui-keenetic) are separate projects
-with their own licenses; install them from their upstream sources.
