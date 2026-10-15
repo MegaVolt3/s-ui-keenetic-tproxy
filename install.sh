@@ -24,9 +24,11 @@ WITH_PUBLIC_IP=0
 PURGE=0
 
 BIN="$PREFIX/sbin/sui-tproxy"
+UPDATE="$PREFIX/sbin/sui-update"
 CONF_DIR="$PREFIX/etc/sui-tproxy"
 CONF="$CONF_DIR/sui-tproxy.conf"
 INIT="$PREFIX/etc/init.d/S99sui-tproxy"
+PANEL_INIT="$PREFIX/etc/init.d/S90s-ui"
 HOOK_DIR="$PREFIX/etc/ndm/netfilter.d"
 HOOK="$HOOK_DIR/sui-tproxy.sh"
 PUBIP_HOOK="$HOOK_DIR/zz-public-ip-local.sh"
@@ -90,7 +92,16 @@ do_install() {
     mkdir -p "$CONF_DIR" "$HOOK_DIR" "$PREFIX/var/log"
 
     put "sbin/sui-tproxy" "$BIN" 755
+    put "sbin/sui-update" "$UPDATE" 755
     put "etc/init.d/S99sui-tproxy" "$INIT" 755
+
+    # The panel's own init script: never overwrite one that is already there
+    # (for example the one shipped by the s-ui-keenetic wrapper s-ui.sh).
+    if [ -e "$PANEL_INIT" ]; then
+        info "keeping existing $PANEL_INIT (panel init script)"
+    else
+        put "etc/init.d/S90s-ui" "$PANEL_INIT" 755
+    fi
 
     if [ -f "$CONF" ]; then
         info "keeping existing config $CONF"
@@ -111,12 +122,15 @@ do_install() {
 
     echo
     info "files installed. Next steps:"
-    echo "      1. create/choose a Keenetic policy and set its description to"
+    echo "      1. install or update the s-ui binary itself:"
+    echo "           $UPDATE --check      # report version / update availability"
+    echo "           $UPDATE              # install the latest release"
+    echo "      2. create/choose a Keenetic policy and set its description to"
     echo "         POLICY_DESCRIPTION from $CONF (default: SUI-TProxy),"
     echo "         then put the client devices into that policy;"
-    echo "      2. make sure the s-ui panel listens on the redirect/tproxy ports;"
-    echo "      3. apply the firewall glue:  $PREFIX/etc/init.d/S99sui-tproxy start"
-    echo "      4. check:                    $PREFIX/etc/init.d/S99sui-tproxy status"
+    echo "      3. make sure the s-ui panel listens on the redirect/tproxy ports;"
+    echo "      4. apply the firewall glue:  $PREFIX/etc/init.d/S99sui-tproxy start"
+    echo "      5. check:                    $PREFIX/etc/init.d/S99sui-tproxy status"
 
     if [ "$DO_START" = 1 ]; then
         [ "$TEST_MODE" = 1 ] && { warn "--start ignored in test mode"; return 0; }
@@ -131,9 +145,16 @@ do_uninstall() {
     if [ -x "$BIN" ]; then
         "$BIN" stop >/dev/null 2>&1 || warn "sui-tproxy stop reported a problem"
     fi
-    for f in "$BIN" "$INIT" "$HOOK" "$PUBIP_HOOK"; do
+    for f in "$BIN" "$UPDATE" "$INIT" "$HOOK" "$PUBIP_HOOK"; do
         if [ -e "$f" ]; then rm -f "$f" && info "removed $f"; fi
     done
+    if [ -e "$PANEL_INIT" ]; then
+        if grep -q "Minimal Entware init script" "$PANEL_INIT" 2>/dev/null; then
+            rm -f "$PANEL_INIT" && info "removed $PANEL_INIT"
+        else
+            info "keeping $PANEL_INIT (not installed by this project)"
+        fi
+    fi
     if [ "$PURGE" = 1 ]; then
         rm -rf "$CONF_DIR" && info "removed $CONF_DIR"
     else
@@ -143,7 +164,7 @@ do_uninstall() {
 
 do_status() {
     echo "prefix: $PREFIX"
-    for f in "$BIN" "$INIT" "$CONF" "$HOOK" "$PUBIP_HOOK"; do
+    for f in "$BIN" "$UPDATE" "$INIT" "$CONF" "$PANEL_INIT" "$HOOK" "$PUBIP_HOOK"; do
         if [ -e "$f" ]; then echo "present: $f"; else echo "absent : $f"; fi
     done
     echo

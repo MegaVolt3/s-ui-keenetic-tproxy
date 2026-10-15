@@ -27,7 +27,10 @@ LAN-клиент (политика SUI-TProxy, mark 0xffffaac)
 | `etc/sui-tproxy/sui-tproxy.conf.example` | `/opt/etc/sui-tproxy/sui-tproxy.conf` | локальные настройки: описание политики, порты, исключения |
 | `etc/ndm/netfilter.d/sui-tproxy.sh.example` | генерируется автоматически | хук, который NDM вызывает после пересборки firewall; в репозитории — только для понимания |
 | `examples/zz-public-ip-local.sh` | `/opt/etc/ndm/netfilter.d/` (опционально) | если публичный адрес живёт на вышестоящем NAT: не пускать локальный трафик к нему в прокси и DNAT-ить его на роутер |
-| `install.sh` | запускается на роутере | установка/удаление/статус |
+| `sbin/sui-update` | `/opt/sbin/sui-update` | установка/обновление **бинарника s-ui** из релизов апстрима: проверка SHA256, бэкап, авто-откат, `--check`, `--from-file` |
+| `etc/init.d/S90s-ui` | `/opt/etc/init.d/` | минимальный init самой панели — ставится только если своего `S90s-ui` ещё нет |
+| `bootstrap.sh` | запускается на роутере | установка одной строкой: зависимости, файлы проекта, свежий бинарник, запуск и проверка |
+| `install.sh` | запускается на роутере | установка/удаление/статус файлов проекта |
 
 ## Требования
 
@@ -45,14 +48,48 @@ LAN-клиент (политика SUI-TProxy, mark 0xffffaac)
 [s-ui-keenetic](https://gitlab.com/own-open-source/s-ui-keenetic) (GPLv3), этот
 репозиторий его не заменяет и не содержит.
 
-## Установка
+## Установка одной строкой
+
+На роутере, от root. Скачать и запустить bootstrap (BusyBox-овый `wget` на части
+прошивок Keenetic не умеет TLS и падает — берите Entware-овый `/opt/bin/wget`
+или `curl`):
+
+```sh
+/opt/bin/wget -qO- https://raw.githubusercontent.com/MegaVolt3/s-ui-keenetic-tproxy/main/bootstrap.sh | sh -s --
+# или, если в системе есть curl:
+curl -fsSL https://raw.githubusercontent.com/MegaVolt3/s-ui-keenetic-tproxy/main/bootstrap.sh | sh -s --
+```
+
+Обратите внимание на `sh -s --`: без `--` шелл сам съедает аргументы.
+
+Что делает bootstrap: ставит недостающие пакеты Entware (`wget-ssl`, `curl`,
+`ca-certificates`, `ipset`, `iptables`), распаковывает проект и вызывает
+`install.sh`, затем ставит через `sui-update` **последний релиз s-ui**,
+поднимает панель и обвязку и печатает проверку (порты, ipset, цепочки, mark
+политики). Полезные ключи:
+
+| Ключ | Смысл |
+|------|-------|
+| `--sui-version latest\|X.Y.Z` | какую версию s-ui поставить (по умолчанию latest) |
+| `--skip-sui` | не трогать бинарник панели (например, уже стоит свой) |
+| `--no-glue` | поставить файлы, но не применять правила firewall |
+| `--policy-desc NAME` | описание политики Keenetic (пишется в конфиг) |
+| `--from-file FILE` | поставить проект из локального tarball (офлайн) |
+| `--dry-run` | показать план и ничего не менять |
+
+Создание самой политики Keenetic остаётся ручным (два клика в UI): нужна
+политика с описанием из `POLICY_DESCRIPTION` и ненулевым `mark`. Пока её нет,
+панель работает, но проксирования не будет — обвязка подхватит mark при
+следующем событии NDM.
+
+### Вручную (без bootstrap)
 
 ```sh
 # на роутере, из каталога с распакованным репозиторием
 ./install.sh --start
 ```
 
-или вручную:
+или совсем вручную:
 
 ```sh
 opkg install ipset iptables iproute2
@@ -105,6 +142,43 @@ grep -a . /proc/net/nf_conntrack | grep "sport=7787"     # живые клиен
 `[ASSURED]` означает, что соединение дошло до цели, `[UNREPLIED] packets=0` — что
 ответа нет (это уже вопрос к правилам/узлу s-ui, а не к обвязке).
 
+## Обновление бинарника s-ui
+
+Бинарник панели обновляется скриптом `sui-update` — прямо на роутере или по ssh
+с рабочей машины:
+
+```sh
+/opt/sbin/sui-update --check        # что стоит, что доступно, есть ли флаг +x
+/opt/sbin/sui-update                # поставить последний релиз
+/opt/sbin/sui-update --version 1.6.4
+/opt/sbin/sui-update --from-file /tmp/s-ui-linux-arm64.tar.gz   # офлайн-архив
+/opt/sbin/sui-update --force        # переустановить (например, починить права)
+
+# из рабочей машины:
+ssh root@<router> /opt/sbin/sui-update --check
+ssh root@<router> /opt/sbin/sui-update
+```
+
+Что гарантируется:
+
+- скачанный `s-ui-linux-<arch>.tar.gz` проверяется по `SHA256SUMS` релиза
+  (`sha256sum` есть и в BusyBox, и в Entware), а распакованный файл — на
+  ELF-магию и разумный размер;
+- ставится **только бинарник**: upstream-овские `s-ui.sh` и `s-ui.service` из
+  архива игнорируются, поэтому ваш `db/`, `config/` и скрипт меню (если он есть
+  от s-ui-keenetic) остаются нетронутыми;
+- установленный файл всегда получает `chmod 755` — это и есть лечение ошибки
+  `nice: can't execute '/opt/etc/s-ui/sui': Permission denied`, которая
+  появляется после ручной заливки бинарника без флага исполнения;
+- предыдущая версия копируется в `/opt/etc/s-ui/backups/` (по умолчанию
+  хранятся 2), и если панель не поднялась на своём порту за 90 с — версия
+  автоматически откатывается из бэкапа;
+- если версия уже актуальна, ничего не делается (`--force` — переустановить), а
+  если бинарник потерял флаг исполнения, переустановка идёт даже без `--force`.
+
+Коды выхода: `0` — успех/уже актуально, `1` — есть обновление (`--check`) или
+обновление не удалось, `2` — ошибка аргументов/окружения.
+
 ## Если что-то не работает
 
 - **s-ui не стартует, в `/opt/var/log/script_s-ui.log` строка
@@ -114,6 +188,16 @@ grep -a . /proc/net/nf_conntrack | grep "sport=7787"     # живые клиен
   `chmod 755 /opt/etc/s-ui/sui && /opt/etc/init.d/S90s-ui start`.
   Повторяемость проверяется по `stat /opt/etc/s-ui/sui`: если `Change` совпадает
   с `Modify`, после перезаписи файла chmod никто не делал.
+- **`download failed` или `Segmentation fault` при скачивании.** В `PATH` на
+  части прошивок Keenetic `wget` — это BusyBox-овый: TLS он не умеет и падает.
+  Используйте `/opt/bin/wget` (пакет `wget-ssl`) или `curl`; `bootstrap.sh` сам
+  поставит их через opkg. BusyBox-овый wget разрешается явно только ключом
+  `--allow-busybox-wget`.
+- **`tar: invalid option -- 'c'`.** Снова BusyBox tar в `PATH`; скрипты сами
+  ищут GNU tar (`/opt/bin/tar`, пакет `tar`), а при ручной распаковке указывайте
+  его явно.
+- **Скрипт по ssh отвечает «unknown argument».** При запуске через
+  `... | sh -s` аргументы надо отделять: `| sh -s -- --check`.
 - **`Keenetic policy 'SUI-TProxy' not found`.** Описание политики не совпало с
   `POLICY_DESCRIPTION` (`ndmc -c "show ip policy"` показывает `description = …:`),
   либо у политики нет `mark`. Правило ищет mark до 120 с — после переименования
@@ -163,9 +247,20 @@ work as a **transparent proxy on Keenetic / Netcraze routers with Entware**:
 - installs a `/opt/etc/ndm/netfilter.d/` hook plus a debounced scheduler so the
   rules survive NDM firewall rebuilds (boot, interface and policy changes);
 - optional `examples/zz-public-ip-local.sh` keeps local access to a public NAT
-  address local instead of sending it through the proxy.
+  address local instead of sending it through the proxy;
+- `bootstrap.sh` installs everything in one line on the router: Entware
+  packages, the project files, the **latest s-ui binary**, then starts the panel
+  and the glue and verifies the result;
+- `sui-update` installs/updates the s-ui binary itself: release download
+  verified against `SHA256SUMS`, backup of the previous version, automatic
+  rollback if the panel does not come back, and `--check` for a dry report -
+  run it on the router or over ssh.
 
-Install on the router with `./install.sh --start`, then tune
-`/opt/etc/sui-tproxy/sui-tproxy.conf`. Requirements: Entware packages `ipset`,
-`iptables`, `iproute2`, a Keenetic policy with a non-zero mark and a matching
-description, and s-ui inbounds on the redirect/tproxy ports. IPv4 only.
+One-line install on the router (root):
+
+    /opt/bin/wget -qO- https://raw.githubusercontent.com/MegaVolt3/s-ui-keenetic-tproxy/main/bootstrap.sh | sh -s --
+
+Then tune `/opt/etc/sui-tproxy/sui-tproxy.conf`. Requirements: Entware packages
+`ipset`, `iptables` (plus `wget-ssl`/`curl` for downloads), a Keenetic policy
+with a non-zero mark and a matching description, and s-ui inbounds on the
+redirect/tproxy ports. IPv4 only.

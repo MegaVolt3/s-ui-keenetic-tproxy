@@ -1,0 +1,468 @@
+#!/bin/sh
+# sui-update -- install / update the s-ui (sing-box) binary on a Keenetic or
+# Netcraze router with Entware, safely and repeatably.
+#
+# Run it on the router, directly or over ssh:
+#     /opt/sbin/sui-update                    # update to the latest upstream release
+#     /opt/sbin/sui-update --check            # only report current vs latest
+#     /opt/sbin/sui-update --version 1.6.4    # pin a version
+#     /opt/sbin/sui-update --from-file /tmp/s-ui-linux-arm64.tar.gz
+#     ssh root@router /opt/sbin/sui-update --check
+#
+# What it guarantees (all of these are things that bit us in practice):
+#   * the binary is always installed EXECUTABLE (chmod 755) - a manual copy or
+#     upload loses the mode and the panel then dies with
+#     "nice: can't execute '/opt/etc/s-ui/sui': Permission denied";
+#   * the download is verified against the release SHA256SUMS when sha256sum is
+#     available, and must be a tar.gz that extracts into a plausible ELF binary;
+#   * the currently running binary is backed up first, and restored
+#     automatically if the panel does not come back up after the swap;
+#   * only the binary is touched - db/, config/ and any wrapper script
+#     (e.g. the s-ui-keenetic s-ui.sh) stay exactly as they are. The upstream
+#     tarball's s-ui.sh and systemd unit are deliberately NOT installed.
+#
+# Exit codes: 0 = ok / already up to date, 1 = update available (--check) or
+# update failed, 2 = usage or environment error.
+
+PREFIX="${PREFIX:-/opt}"
+DIR="$PREFIX/etc/s-ui"
+BIN="$DIR/sui"
+BACKUP_DIR="$DIR/backups"
+INIT="$PREFIX/etc/init.d/S90s-ui"
+LOG="$PREFIX/var/log/sui-update.log"
+TMP="$PREFIX/tmp/sui-update.$$"
+REPO="${REPO:-alireza0/s-ui}"
+API="https://api.github.com/repos/$REPO/releases"
+DL="https://github.com/$REPO/releases/download"
+
+TEST_MODE=0
+[ "$PREFIX" != "/opt" ] && TEST_MODE=1
+
+PANEL_PORT="${PANEL_PORT:-2095}"
+PANEL_LOG="$PREFIX/var/log/s-ui-panel.log"
+KEEP=2
+CHECK_ONLY=0
+FORCE=0
+DRY_RUN=0
+NO_RESTART=0
+WANT_VERSION=""
+FROM_FILE=""
+
+usage() {
+    cat <<EOF
+Usage: $0 [options]
+
+  (no options)          update to the latest upstream release
+  --check               report installed/latest version and the binary's mode; no changes
+  --version X.Y.Z       install this version instead of the latest
+  --from-file ARCHIVE   install from a local s-ui-linux-<arch>.tar.gz (offline)
+  --force               reinstall even when the version is already current
+  --no-restart          do not stop/start the panel around the swap
+  --keep N              keep N old binaries in $BACKUP_DIR (default $KEEP)
+  --dry-run             print what would be done, change nothing
+  -h, --help            this text
+
+Environment:
+  PREFIX=/opt            install prefix (non-/opt implies test mode)
+  PANEL_PORT=2095        web port used to wait for the panel after a swap
+  REPO=alireza0/s-ui     upstream repository to take releases from
+EOF
+}
+
+die() { log "ERROR: $*"; echo "ERROR: $*" >&2; exit 2; }
+warn() { log "WARN: $*"; echo "WARN: $*" >&2; }
+info() { log "$*"; echo "[ + ] $*"; }
+
+log() {
+    if [ -d "$(dirname "$LOG")" ] || mkdir -p "$(dirname "$LOG")" 2>/dev/null; then
+        printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG" 2>/dev/null || true
+    fi
+}
+
+# --- helpers ---------------------------------------------------------------
+
+# Note: no "local" (plain POSIX sh) - every variable is prefixed per function so
+# one function cannot clobber another's values.
+with_timeout() { # <seconds> <command...>
+    wt_secs="$1"; shift
+    mkdir -p "$TMP" 2>/dev/null
+    "$@" >"$TMP/out" 2>&1 &
+    wt_pid=$!
+    wt_i=0
+    while [ "$wt_i" -lt "$wt_secs" ]; do
+        kill -0 "$wt_pid" 2>/dev/null || break
+        sleep 1
+        wt_i=$((wt_i + 1))
+    done
+    if kill -0 "$wt_pid" 2>/dev/null; then
+        kill -9 "$wt_pid" 2>/dev/null
+        wait "$wt_pid" 2>/dev/null
+        return 124
+    fi
+    wait "$wt_pid" 2>/dev/null
+    return $?
+}
+
+detect_downloader() {
+    if command -v curl >/dev/null 2>&1; then
+        DL_CURL=$(command -v curl)
+        return 0
+    fi
+    for dl_w in /opt/bin/wget /opt/libexec/wget-ssl wget; do
+        if command -v "$dl_w" >/dev/null 2>&1 && "$dl_w" --version 2>&1 | grep -q 'GNU Wget'; then
+            DL_WGET="$dl_w"
+            return 0
+        fi
+    done
+    return 1
+}
+
+fetch_stdout() { # <url>
+    if [ -n "$DL_CURL" ]; then "$DL_CURL" -fsSL --max-time 300 "$1"; else "$DL_WGET" -qO- -T 300 "$1"; fi
+}
+
+fetch_file() { # <url> <file>
+    if [ -n "$DL_CURL" ]; then
+        "$DL_CURL" -fsSL --max-time 900 -o "$2" "$1"
+    else
+        "$DL_WGET" -q -T 900 -O "$2" "$1"
+    fi
+}
+
+detect_tar() {
+    # BusyBox tar cannot create archives and differs in flags; prefer GNU tar.
+    TAR=""
+    for dt_c in "$PREFIX/bin/tar" "$PREFIX/usr/bin/tar" tar; do
+        if command -v "$dt_c" >/dev/null 2>&1 && "$dt_c" --version >/dev/null 2>&1; then
+            TAR="$dt_c"
+            return 0
+        fi
+    done
+    if command -v tar >/dev/null 2>&1; then
+        TAR=tar
+        return 0
+    fi
+    return 1
+}
+
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64 | amd64) echo amd64 ;;
+        i?86) echo 386 ;;
+        aarch64 | arm64 | armv8*) echo arm64 ;;
+        armv7*) echo armv7 ;;
+        armv6*) echo armv6 ;;
+        armv5*) echo armv5 ;;
+        s390x) echo s390x ;;
+        *) echo "" ;;
+    esac
+}
+
+port_hex() { printf '%04X' "$1"; }
+
+port_listening() { # <port>
+    pl_hex=$(port_hex "$1")
+    awk -v h="$pl_hex" 'NR > 1 && $2 ~ ":" h "$" && $4 == "0A" { f = 1 } END { exit !f }' \
+        /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+
+binary_is_executable() { [ -x "$BIN" ]; }
+
+current_version() {
+    cv_ver=""
+    if [ -x "$BIN" ]; then
+        with_timeout 20 "$BIN" -v >/dev/null 2>&1 || true
+        cv_ver=$(grep -m1 'S-UI Panel' "$TMP/out" 2>/dev/null | awk '{print $3}')
+        if [ -z "$cv_ver" ]; then
+            cv_ver=$(grep -m1 -o 's-ui [0-9][0-9.]*' "$LOG" 2>/dev/null | tail -1 | awk '{print $2}')
+        fi
+    fi
+    printf '%s' "$cv_ver"
+}
+
+latest_version() {
+    lv_tag=$(fetch_stdout "$API/latest" 2>/dev/null | head -c 20000 |
+        grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/.*"tag_name": *"//; s/"$//')
+    [ -n "$lv_tag" ] || return 1
+    printf '%s' "${lv_tag#v}"
+}
+
+verify_archive() { # <archive> <expected sha or "">
+    va_arch="$1"
+    va_sum="$2"
+    va_size=$(wc -c <"$va_arch" 2>/dev/null || echo 0)
+    if [ "$va_size" -lt 5000000 ]; then
+        warn "archive is suspiciously small ($va_size bytes)"
+        return 1
+    fi
+    if [ -n "$va_sum" ]; then
+        if command -v sha256sum >/dev/null 2>&1; then
+            va_got=$(sha256sum "$va_arch" | awk '{print $1}')
+            if [ "$va_got" != "$va_sum" ]; then
+                warn "SHA256 mismatch: expected $va_sum, got $va_got"
+                return 1
+            fi
+            info "SHA256 verified ($va_got)"
+        else
+            warn "sha256sum unavailable - skipping checksum verification"
+        fi
+    fi
+    "$TAR" tzf "$va_arch" >/dev/null 2>&1 || { warn "archive does not list as tar.gz"; return 1; }
+    return 0
+}
+
+extract_binary() { # <archive>; sets NEWBIN
+    NEWBIN=""
+    rm -rf "$TMP/extract"
+    mkdir -p "$TMP/extract" || return 1
+    "$TAR" -xzf "$1" -C "$TMP/extract" >/dev/null 2>&1 || return 1
+    NEWBIN=$(find "$TMP/extract" -type f -name sui 2>/dev/null | head -1)
+    if [ -z "$NEWBIN" ]; then
+        NEWBIN=$(find "$TMP/extract" -type f -size +5000k 2>/dev/null | head -1)
+    fi
+    [ -n "$NEWBIN" ] || return 1
+    eb_magic=$(dd if="$NEWBIN" bs=1 count=4 2>/dev/null)
+    if [ "$eb_magic" != "$(printf '\177ELF')" ]; then
+        warn "extracted file is not an ELF binary"
+        return 1
+    fi
+    eb_size=$(wc -c <"$NEWBIN" 2>/dev/null || echo 0)
+    info "candidate binary: $(basename "$NEWBIN"), $eb_size bytes"
+    return 0
+}
+
+version_of_binary() { # <file>
+    vb_ver=""
+    if [ -n "$2" ] || [ -x "$1" ]; then
+        with_timeout 20 "$1" -v >/dev/null 2>&1 || true
+        vb_ver=$(grep -m1 'S-UI Panel' "$TMP/out" 2>/dev/null | awk '{print $3}')
+    fi
+    printf '%s' "$vb_ver"
+}
+
+panel_stop() {
+    if [ -x "$INIT" ]; then
+        "$INIT" stop >/dev/null 2>&1 || true
+    fi
+    ps_i=0
+    while [ "$ps_i" -lt 15 ]; do
+        port_listening "$PANEL_PORT" || return 0
+        sleep 1
+        ps_i=$((ps_i + 1))
+    done
+    ps_pids=$(pidof sui 2>/dev/null)
+    if [ -n "$ps_pids" ]; then
+        warn "panel still listening on $PANEL_PORT, sending TERM to: $ps_pids"
+        kill $ps_pids 2>/dev/null
+        sleep 2
+    fi
+    port_listening "$PANEL_PORT" && warn "panel port $PANEL_PORT is still busy"
+    return 0
+}
+
+panel_start() {
+    if [ -x "$INIT" ]; then
+        "$INIT" start >/dev/null 2>&1 || true
+        return 0
+    fi
+    if [ -x "$BIN" ]; then
+        info "no $INIT - starting the panel directly"
+        mkdir -p "$(dirname "$PANEL_LOG")"
+        ( cd "$DIR" && nice -n -5 ./sui >>"$PANEL_LOG" 2>&1 & ) || true
+    fi
+}
+
+wait_panel() { # <seconds>
+    wp_secs="${1:-60}"
+    wp_i=0
+    while [ "$wp_i" -lt "$wp_secs" ]; do
+        port_listening "$PANEL_PORT" && return 0
+        sleep 1
+        wp_i=$((wp_i + 1))
+    done
+    return 1
+}
+
+prune_backups() { # <keep>
+    pb_keep="${1:-2}"
+    [ -d "$BACKUP_DIR" ] || return 0
+    pb_n=0
+    for pb_f in $(ls -1t "$BACKUP_DIR"/sui-* 2>/dev/null); do
+        pb_n=$((pb_n + 1))
+        if [ "$pb_n" -gt "$pb_keep" ]; then
+            rm -f "$pb_f" && info "removed old backup $(basename "$pb_f")"
+        fi
+    done
+}
+
+free_space_kb() { df -k "$PREFIX" 2>/dev/null | awk 'NR > 1 { print $4; exit }'; }
+
+# --- argument parsing ------------------------------------------------------
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --check) CHECK_ONLY=1 ;;
+        --version) shift; WANT_VERSION="$1" ;;
+        --from-file) shift; FROM_FILE="$1" ;;
+        --force) FORCE=1 ;;
+        --dry-run) DRY_RUN=1 ;;
+        --no-restart) NO_RESTART=1 ;;
+        --keep) shift; KEEP="$1" ;;
+        -h | --help) usage; exit 0 ;;
+        *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
+    esac
+    shift
+done
+
+mkdir -p "$TMP" "$BACKUP_DIR" 2>/dev/null
+
+# --- --check ---------------------------------------------------------------
+
+if [ "$CHECK_ONLY" = 1 ]; then
+    dl_state="no"
+    detect_downloader && dl_state="${DL_CURL:-$DL_WGET}"
+    dash_ver=$(current_version)
+    echo "binary      : $BIN"
+    if [ -f "$BIN" ]; then
+        echo "size        : $(wc -c <"$BIN") bytes"
+        if binary_is_executable; then
+            echo "mode        : executable"
+        else
+            echo "mode        : NOT EXECUTABLE  <-- run: chmod 755 $BIN"
+        fi
+    else
+        echo "size        : (missing)"
+    fi
+    echo "installed   : ${dash_ver:-unknown}"
+    if detect_downloader; then
+        latest=$(latest_version) || latest=""
+        echo "latest      : ${latest:-unknown (github api unreachable)}"
+        echo "downloader  : $dl_state"
+        if [ -n "$latest" ] && [ "$latest" != "$dash_ver" ]; then
+            echo "status      : update available ($dash_ver -> $latest)"
+            rm -rf "$TMP"
+            exit 1
+        fi
+        echo "status      : up to date"
+    fi
+    rm -rf "$TMP"
+    [ -f "$BIN" ] && binary_is_executable
+    exit $?
+fi
+
+# --- resolve the source archive -------------------------------------------
+
+detect_downloader || die "need curl or GNU wget on the router: opkg install curl wget-ssl"
+detect_tar || warn "tar not found - archive verification may fail"
+
+ARCH=$(detect_arch)
+[ -n "$ARCH" ] || die "unsupported architecture: $(uname -m)"
+
+OLD_VER=$(current_version)
+[ -n "$OLD_VER" ] && info "installed version: $OLD_VER" || warn "cannot determine the installed version"
+
+if [ -n "$FROM_FILE" ]; then
+    [ -f "$FROM_FILE" ] || die "no such file: $FROM_FILE"
+    ARCHIVE="$FROM_FILE"
+    SUM=""
+    VER="${WANT_VERSION:-}"
+    info "using local archive $FROM_FILE"
+else
+    if [ -n "$WANT_VERSION" ]; then
+        VER="${WANT_VERSION#v}"
+    else
+        VER=$(latest_version) || die "cannot resolve the latest version from $API (network or rate limit?)"
+    fi
+    info "target version: $VER ($ARCH)"
+    ARCHIVE="$TMP/s-ui-linux-$ARCH.tar.gz"
+    ASSET="s-ui-linux-$ARCH.tar.gz"
+    fetch_file "$DL/v$VER/$ASSET" "$ARCHIVE" || die "download failed: $DL/v$VER/$ASSET"
+    info "downloaded $(wc -c <"$ARCHIVE") bytes"
+    SUM=$(fetch_stdout "$DL/v$VER/SHA256SUMS" 2>/dev/null | awk -v a="$ASSET" '$2 == a { print $1; exit }')
+    [ -n "$SUM" ] || warn "no SHA256SUMS entry found for $ASSET"
+fi
+
+verify_archive "$ARCHIVE" "$SUM" || { [ "$FORCE" = 1 ] && warn "continuing because of --force" || { rm -rf "$TMP"; die "archive verification failed"; }; }
+
+extract_binary "$ARCHIVE" || { rm -rf "$TMP"; die "archive does not contain a usable sui binary"; }
+
+NEW_VER=$(version_of_binary "$NEWBIN" "" )
+[ -n "$NEW_VER" ] || NEW_VER="$VER"
+
+if [ -n "$OLD_VER" ] && [ "$NEW_VER" = "$OLD_VER" ] && [ "$FORCE" != 1 ] && [ -z "$FROM_FILE" ] && binary_is_executable; then
+    info "already at $OLD_VER - nothing to do (use --force to reinstall)"
+    rm -rf "$TMP"
+    exit 0
+fi
+
+if [ "$DRY_RUN" = 1 ]; then
+    echo
+    info "dry run - would do the following:"
+    echo "      stop panel:   $INIT stop   (port $PANEL_PORT)"
+    echo "      backup:       $BACKUP_DIR/sui-${OLD_VER:-unknown}-<timestamp>"
+    echo "      install:      cp $NEWBIN -> $BIN, chmod 755"
+    echo "      start panel:  $INIT start, wait for port $PANEL_PORT"
+    echo "      rollback:     automatic on startup failure"
+    rm -rf "$TMP"
+    exit 0
+fi
+
+# --- install --------------------------------------------------------------
+
+FS_KB=$(free_space_kb)
+if [ -n "$FS_KB" ] && [ "$FS_KB" -lt 300000 ]; then
+    warn "only $((FS_KB / 1024)) MB free on $PREFIX - the swap needs ~200 MB plus backups"
+fi
+
+if [ "$NO_RESTART" != 1 ]; then
+    info "stopping the panel"
+    panel_stop
+fi
+
+BACKUP=""
+if [ -f "$BIN" ]; then
+    BACKUP="$BACKUP_DIR/sui-${OLD_VER:-unknown}-$(date +%Y%m%d-%H%M%S)"
+    cp -p "$BIN" "$BACKUP" || die "cannot back up $BIN"
+    info "backed up current binary to $BACKUP"
+fi
+
+cp -f "$NEWBIN" "$BIN.new" || die "cannot write $BIN.new"
+chmod 755 "$BIN.new" || die "cannot chmod $BIN.new"
+mv -f "$BIN.new" "$BIN" || die "cannot replace $BIN"
+chmod 755 "$BIN" || die "cannot chmod $BIN"
+info "installed $BIN ($(wc -c <"$BIN") bytes, mode $(ls -l "$BIN" | awk '{print $1}'))"
+
+INSTALLED_VER=$(version_of_binary "$BIN" x)
+[ -n "$INSTALLED_VER" ] || INSTALLED_VER="$NEW_VER"
+
+if [ "$NO_RESTART" != 1 ]; then
+    info "starting the panel"
+    panel_start
+    if wait_panel 90; then
+        info "panel is listening on port $PANEL_PORT"
+    else
+        warn "panel did not come up on port $PANEL_PORT within 90 s"
+        if [ -n "$BACKUP" ]; then
+            warn "rolling back to $BACKUP"
+            cp -f "$BACKUP" "$BIN" && chmod 755 "$BIN"
+            panel_start
+            if wait_panel 60; then
+                info "rollback done - panel is running the previous version again"
+            else
+                warn "panel still not listening after rollback; check $PANEL_LOG and /opt/var/log/script_s-ui.log"
+            fi
+            rm -rf "$TMP"
+            exit 1
+        fi
+        warn "no backup available to roll back to"
+        rm -rf "$TMP"
+        exit 1
+    fi
+fi
+
+rm -rf "$TMP"
+prune_backups "$KEEP"
+
+info "done: s-ui ${INSTALLED_VER:-unknown} installed (was ${OLD_VER:-unknown})"
+[ "$INSTALLED_VER" != "${OLD_VER:-}" ] && info "restart the proxy glue if it was running: $PREFIX/etc/init.d/S99sui-tproxy restart"
+exit 0

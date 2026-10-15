@@ -1,0 +1,104 @@
+#!/bin/sh
+# Minimal Entware init script (S90) for the s-ui panel itself.
+#
+# Only needed when the router has no panel init script of its own; the
+# installer and bootstrap.sh refuse to overwrite an existing S90s-ui (for
+# example the one shipped by the s-ui-keenetic wrapper s-ui.sh).
+#
+# Usage: S90s-ui {start|stop|restart|status}
+PREFIX="${PREFIX:-/opt}"
+DIR="$PREFIX/etc/s-ui"
+BIN="$DIR/sui"
+PIDFILE="$PREFIX/var/run/s-ui.pid"
+LOG="$PREFIX/var/log/s-ui-panel.log"
+PORT="${SUI_WEB_PORT:-2095}"
+
+port_listening() {
+    pl_hex=$(printf '%04X' "$PORT")
+    awk -v h="$pl_hex" 'NR > 1 && $2 ~ ":" h "$" && $4 == "0A" { f = 1 } END { exit !f }' \
+        /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+
+running_pid() {
+    rp=""
+    if [ -f "$PIDFILE" ]; then
+        read -r rp <"$PIDFILE"
+        [ -n "$rp" ] && kill -0 "$rp" 2>/dev/null || rp=""
+    fi
+    printf '%s' "$rp"
+}
+
+do_start() {
+    rp=$(running_pid)
+    if [ -n "$rp" ]; then
+        echo "s-ui already running (pid $rp)"
+        return 0
+    fi
+    if [ ! -f "$BIN" ]; then
+        echo "s-ui binary not found: $BIN" >&2
+        return 1
+    fi
+    if [ ! -x "$BIN" ]; then
+        echo "s-ui binary is not executable: $BIN (chmod 755 $BIN)" >&2
+        return 1
+    fi
+    mkdir -p "$(dirname "$PIDFILE")" "$(dirname "$LOG")"
+    # Background subshell + exec: $! is the panel's own pid, and the log stays
+    # attached (start-stop-daemon would send the child's output to /dev/null).
+    ( cd "$DIR" && exec ./sui >>"$LOG" 2>&1 ) &
+    echo $! >"$PIDFILE"
+    i=0
+    while [ "$i" -lt 30 ]; do
+        port_listening && { echo "s-ui started, listening on $PORT"; return 0; }
+        sleep 1
+        i=$((i + 1))
+    done
+    echo "s-ui started but is not listening on $PORT yet (see $LOG)" >&2
+    return 1
+}
+
+do_stop() {
+    rp=$(running_pid)
+    if [ -z "$rp" ]; then
+        echo "s-ui is not running"
+        rm -f "$PIDFILE"
+        return 0
+    fi
+    kill "$rp" 2>/dev/null
+    i=0
+    while [ "$i" -lt 15 ]; do
+        kill -0 "$rp" 2>/dev/null || break
+        sleep 1
+        i=$((i + 1))
+    done
+    kill -0 "$rp" 2>/dev/null && kill -9 "$rp" 2>/dev/null
+    rm -f "$PIDFILE"
+    echo "s-ui stopped"
+    return 0
+}
+
+do_status() {
+    rp=$(running_pid)
+    if [ -n "$rp" ]; then
+        echo "s-ui is running (pid $rp)${PORT:+$(port_listening && echo ", listening on $PORT" || echo ", port $PORT not listening")}"
+        return 0
+    fi
+    # the panel may have been started by another script; fall back to the port
+    if port_listening; then
+        echo "port $PORT is listening but no pid file - panel started outside this script"
+        return 0
+    fi
+    echo "s-ui is stopped"
+    return 1
+}
+
+case "${1:-start}" in
+    start) do_start ;;
+    stop) do_stop ;;
+    restart) do_stop; do_start ;;
+    status | check) do_status ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}" >&2
+        exit 2
+        ;;
+esac
