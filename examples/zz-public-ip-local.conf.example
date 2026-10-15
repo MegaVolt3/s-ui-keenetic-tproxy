@@ -1,0 +1,13 @@
+# /opt/etc/sui-tproxy/zz-public-ip-local.conf
+# Settings for examples/zz-public-ip-local.sh (optional component).
+# All values below are placeholders - replace them with your own.
+
+# The public address that lives on an upstream NAT device in front of this router.
+# Empty value => the script exits immediately and changes nothing.
+PUBLIC_IP=""
+
+# The router's own LAN address, where that public address should be redirected.
+ROUTER_IP="192.168.1.1"
+
+# Bridge / WireGuard interfaces that hold LAN clients.
+LAN_IFACES="br0"

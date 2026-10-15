@@ -1,0 +1,49 @@
+# /opt/etc/sui-tproxy/sui-tproxy.conf
+# Site-specific settings for sui-tproxy. This file is *sourced* by the script
+# (plain POSIX sh), so keep it to variable assignments.
+#
+# Copy to /opt/etc/sui-tproxy/sui-tproxy.conf and edit. Values here override
+# the built-in defaults.
+
+# ---------------------------------------------------------------------------
+# Which Keenetic policy to serve.
+# The script finds the policy by its DESCRIPTION (see `ndmc -c "show ip policy"`)
+# and reads its mark; devices placed in that policy get transparently proxied.
+# Keep the same description in the router UI ("Description" field) and here.
+POLICY_DESCRIPTION="SUI-TProxy"
+
+# Optional: pin the mark explicitly instead of asking ndmc for it.
+# Useful when the description is renamed often or ndmc is unavailable.
+# Toolbar "mark:" value from `ndmc -c "show ip policy"`, e.g. ffffaac.
+#POLICY_MARK="0xffffaac"
+
+# ---------------------------------------------------------------------------
+# s-ui inbounds the traffic is funnelled into.
+# These must match your s-ui inbounds:
+#   - one TCP redirect inbound on REDIRECT_PORT  (sniff + redirect, "tproxy"-style REDIRECT)
+#   - one UDP tproxy inbound on TPROXY_PORT
+REDIRECT_PORT="7787"
+TPROXY_PORT="7788"
+
+# fwmark/table used for the local TProxy route (keep them distinct from other
+# policy routing on the router).
+TPROXY_MARK="0x113"
+TPROXY_TABLE="113"
+
+# ---------------------------------------------------------------------------
+# Ports that always stay direct, even for devices inside the policy.
+# Default is minimal: NTP (123) and the s-ui panel port (2095), so the panel
+# stays reachable from LAN clients. Add whatever your setup needs - a typical
+# Keenetic router also keeps Entware SSH and its own web services direct:
+#BYPASS_PORTS="123 2095 222 8090 80 443"
+BYPASS_PORTS="123 2095"
+
+# ---------------------------------------------------------------------------
+# Extra destination networks that must never go through the proxy.
+# Reserved/private networks (RFC1918, loopback, multicast, ...) are always
+# bypassed by the script itself; list only the extra ones here. Typical use:
+#   - the router's public address, when it belongs to an upstream NAT device
+#     (otherwise LAN clients dialling it get pulled into the proxy);
+#   - neighbouring subnets that must stay reachable directly.
+# Example (two entries - replace with your own):
+#EXTRA_BYPASS_NETS="203.0.113.10/32 192.168.1.0/24"

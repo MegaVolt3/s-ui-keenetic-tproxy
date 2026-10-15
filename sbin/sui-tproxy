@@ -1,0 +1,351 @@
+#!/bin/sh
+# sui-tproxy -- Keenetic / Netcraze policy glue for s-ui (sing-box) transparent proxying.
+#
+# What it does: reads the mark of a Keenetic NDM policy ("SUI-TProxy") via ndmc,
+# then builds REDIRECT (TCP) and TProxy (UDP) rules for LAN clients that belong to
+# that policy, keeps reserved/private destinations direct, and re-applies the rules
+# after NDM rebuilds its own firewall (netfilter.d hook + delayed scheduler).
+#
+# Site-specific values (your public WAN address, extra bypass networks) belong in
+# /opt/etc/sui-tproxy/sui-tproxy.conf, not in this file.
+#
+# License: MIT (see LICENSE).  Tested on: KeeneticOS 4.x + Entware, s-ui 1.6.5,
+# iptables-legacy (xtables-multi), ipset 7.x, iproute2 from Entware.
+VERSION="1.0.0"
+PATH=/opt/sbin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+CONF="/opt/etc/sui-tproxy/sui-tproxy.conf"
+HOOK="/opt/etc/ndm/netfilter.d/sui-tproxy.sh"
+LOGTAG="SUI-TProxy"
+BYPASS_SET="sui_tproxy_bypass4"
+NAT_CHAIN="sui_tproxy_nat"
+MANGLE_CHAIN="sui_tproxy_mangle"
+LOCK_DIR="/tmp/sui-tproxy.lock"
+LOCK_PID="$LOCK_DIR/pid"
+SCHEDULE_LOCK_DIR="/tmp/sui-tproxy-schedule.lock"
+SCHEDULE_LOCK_PID="$SCHEDULE_LOCK_DIR/pid"
+
+POLICY_DESCRIPTION="SUI-TProxy"
+POLICY_MARK="${POLICY_MARK:-}"
+POLICY_MARK_CACHE="/tmp/sui-tproxy.policy-mark"
+REDIRECT_PORT="7787"
+TPROXY_PORT="7788"
+TPROXY_MARK="0x113"
+TPROXY_TABLE="113"
+# Minimal default: NTP and the s-ui panel port, so the panel stays reachable
+# from clients inside the policy. Site-specific ports and networks belong in
+# sui-tproxy.conf - see etc/sui-tproxy/sui-tproxy.conf.example.
+BYPASS_PORTS="123 2095"
+# Site-specific extra bypass networks: set them in sui-tproxy.conf.
+EXTRA_BYPASS_NETS=""
+RESERVED_NETS="0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.31.196.0/24 192.52.193.0/24 192.88.99.0/24 192.168.0.0/16 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4 255.255.255.255/32"
+
+[ -r "$CONF" ] && . "$CONF"
+
+log() {
+    logger -p notice -t "$LOGTAG" "$*" 2>/dev/null || true
+    printf '%s\n' "$*"
+}
+
+warn() {
+    logger -p warning -t "$LOGTAG" "$*" 2>/dev/null || true
+    printf 'WARN: %s\n' "$*" >&2
+}
+
+acquire_lock() {
+    timeout="${1:-30}"
+    i=0
+    while [ "$i" -lt "$timeout" ]; do
+        if mkdir "$LOCK_DIR" 2>/dev/null; then
+            printf '%s\n' "$$" >"$LOCK_PID"
+            trap 'rm -rf "$LOCK_DIR" 2>/dev/null || true' EXIT INT TERM
+            return 0
+        fi
+        if [ -f "$LOCK_PID" ]; then
+            read -r lock_pid <"$LOCK_PID"
+            if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
+                rm -rf "$LOCK_DIR" 2>/dev/null || true
+                continue
+            fi
+        else
+            rm -rf "$LOCK_DIR" 2>/dev/null || true
+            continue
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    warn "could not acquire lock $LOCK_DIR"
+    return 1
+}
+
+release_lock() {
+    if [ -f "$LOCK_PID" ]; then
+        read -r lock_pid <"$LOCK_PID"
+        [ "$lock_pid" = "$$" ] && rm -rf "$LOCK_DIR" 2>/dev/null || true
+    fi
+    trap - EXIT INT TERM
+}
+
+normalize_mark() {
+    mark="$1"
+    mark="${mark#0x}"
+    mark="${mark#0X}"
+    [ -n "$mark" ] && printf '0x%s\n' "$mark"
+}
+
+get_policy_mark() {
+    if [ -n "$POLICY_MARK" ]; then
+        normalize_mark "$POLICY_MARK"
+        return 0
+    fi
+
+    mark="$(ndmc -c show ip policy 2>/dev/null | awk -v desc="$POLICY_DESCRIPTION" '
+        BEGIN { wanted = tolower(desc); in_policy = 0 }
+        /policy, name =/ {
+            line = tolower($0)
+            in_policy = (line ~ "description = " wanted ":")
+        }
+        in_policy && /mark:/ {
+            print $2
+            exit
+        }
+    ')"
+    if [ -n "$mark" ]; then
+        mark="$(normalize_mark "$mark")"
+        printf '%s\n' "$mark" >"$POLICY_MARK_CACHE" 2>/dev/null || true
+        printf '%s\n' "$mark"
+        return 0
+    fi
+
+    if [ -r "$POLICY_MARK_CACHE" ]; then
+        read -r mark <"$POLICY_MARK_CACHE"
+        if [ -n "$mark" ]; then
+            normalize_mark "$mark"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+wait_policy_mark() {
+    timeout="${1:-120}"
+    i=0
+    while [ "$i" -lt "$timeout" ]; do
+        mark="$(get_policy_mark)"
+        if [ -n "$mark" ]; then
+            printf '%s\n' "$mark"
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+ports_csv() {
+    printf '%s\n' "$BYPASS_PORTS" | tr ' ' ',' | sed 's/,,*/,/g; s/^,//; s/,$//'
+}
+
+load_tproxy_module() {
+    lsmod 2>/dev/null | awk '$1 == "xt_TPROXY" { found = 1 } END { exit !found }' && return 0
+    modprobe xt_TPROXY 2>/dev/null && return 0
+    for path in /lib/modules/$(uname -r)/xt_TPROXY.ko /opt/lib/modules/xt_TPROXY.ko; do
+        [ -f "$path" ] && insmod "$path" 2>/dev/null && return 0
+    done
+    warn "xt_TPROXY module is not loaded; UDP TProxy may fail"
+    return 0
+}
+
+port_hex() {
+    printf '%04X' "$1"
+}
+
+proc_has_tcp_port() {
+    hex="$(port_hex "$1")"
+    awk -v h="$hex" 'NR > 1 && $2 ~ ":" h "$" && $4 == "0A" { found = 1 } END { exit !found }' \
+        /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+
+proc_has_udp_port() {
+    hex="$(port_hex "$1")"
+    awk -v h="$hex" 'NR > 1 && $2 ~ ":" h "$" { found = 1 } END { exit !found }' \
+        /proc/net/udp /proc/net/udp6 2>/dev/null
+}
+
+wait_sui_ports() {
+    timeout="${1:-20}"
+    i=0
+    while [ "$i" -lt "$timeout" ]; do
+        if proc_has_tcp_port "$REDIRECT_PORT" && proc_has_udp_port "$TPROXY_PORT"; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    warn "s-ui is not listening on TCP/$REDIRECT_PORT and UDP/$TPROXY_PORT"
+    return 1
+}
+
+setup_bypass_set() {
+    ipset create "$BYPASS_SET" hash:net family inet -exist
+    ipset flush "$BYPASS_SET"
+    for net in $RESERVED_NETS $EXTRA_BYPASS_NETS; do
+        ipset add "$BYPASS_SET" "$net" -exist 2>/dev/null || true
+    done
+    ip -4 addr show 2>/dev/null | awk '/ inet / { split($2, a, "/"); print a[1] "/32" }' | while read -r ipnet; do
+        [ -n "$ipnet" ] && ipset add "$BYPASS_SET" "$ipnet" -exist 2>/dev/null || true
+    done
+}
+
+setup_tproxy_route() {
+    while ip -4 rule del fwmark "$TPROXY_MARK" lookup "$TPROXY_TABLE" >/dev/null 2>&1; do :; done
+    ip -4 route flush table "$TPROXY_TABLE" >/dev/null 2>&1 || true
+    ip -4 rule add fwmark "$TPROXY_MARK" lookup "$TPROXY_TABLE"
+    ip -4 route add local default dev lo table "$TPROXY_TABLE"
+}
+
+clean_chain() {
+    table="$1"
+    chain="$2"
+    parent="$3"
+    while rule_num=$(iptables -w -t "$table" -nL "$parent" --line-numbers 2>/dev/null | awk -v ch="$chain" '$0 ~ ch {print $1; exit}') && [ -n "$rule_num" ]; do
+        iptables -w -t "$table" -D "$parent" "$rule_num" >/dev/null 2>&1 || break
+    done
+    if iptables -w -t "$table" -nL "$chain" >/dev/null 2>&1; then
+        iptables -w -t "$table" -F "$chain" >/dev/null 2>&1 || true
+        iptables -w -t "$table" -X "$chain" >/dev/null 2>&1 || true
+    fi
+}
+
+clean_rules() {
+    clean_chain nat "$NAT_CHAIN" PREROUTING
+    clean_chain mangle "$MANGLE_CHAIN" PREROUTING
+    while ip -4 rule del fwmark "$TPROXY_MARK" lookup "$TPROXY_TABLE" >/dev/null 2>&1; do :; done
+    ip -4 route flush table "$TPROXY_TABLE" >/dev/null 2>&1 || true
+    ipset flush "$BYPASS_SET" >/dev/null 2>&1 || true
+    ipset destroy "$BYPASS_SET" >/dev/null 2>&1 || true
+}
+
+create_hook() {
+    mkdir -p "$(dirname "$HOOK")"
+    hook_policy_mark="$(get_policy_mark 2>/dev/null || true)"
+    {
+        cat <<'HOOK_HEAD'
+#!/bin/sh
+[ "$type" = "iptables" ] || exit 0
+[ "$table" = "nat" ] || [ "$table" = "mangle" ] || exit 0
+HOOK_HEAD
+        if [ -n "$hook_policy_mark" ]; then
+            printf 'POLICY_MARK="%s"\n' "$hook_policy_mark"
+            printf 'export POLICY_MARK\n'
+        fi
+        cat <<'HOOK_TAIL'
+/opt/sbin/sui-tproxy schedule
+HOOK_TAIL
+    } > "$HOOK"
+    chmod 755 "$HOOK"
+}
+
+schedule_apply() {
+    mkdir -p /opt/var/log
+    if ! mkdir "$SCHEDULE_LOCK_DIR" 2>/dev/null; then
+        schedule_pid=""
+        [ -f "$SCHEDULE_LOCK_PID" ] && read -r schedule_pid <"$SCHEDULE_LOCK_PID"
+        if [ -n "$schedule_pid" ] && kill -0 "$schedule_pid" 2>/dev/null; then
+            return 0
+        fi
+        warn "removing stale schedule lock $SCHEDULE_LOCK_DIR"
+        rm -rf "$SCHEDULE_LOCK_DIR" 2>/dev/null || true
+        mkdir "$SCHEDULE_LOCK_DIR" 2>/dev/null || return 0
+    fi
+    printf '%s\n' "$$" >"$SCHEDULE_LOCK_PID" 2>/dev/null || true
+    (
+        trap 'rm -rf "$SCHEDULE_LOCK_DIR" 2>/dev/null || true' EXIT INT TERM
+        result=1
+        for delay in 5 15 30 60 120; do
+            sleep "$delay"
+            [ -f "$HOOK" ] || exit 0
+            apply_rules && result=0
+        done
+        exit "$result"
+    ) >>/opt/var/log/sui-tproxy-firewall.log 2>&1 &
+    printf '%s\n' "$!" >"$SCHEDULE_LOCK_PID" 2>/dev/null || true
+}
+
+apply_rules() {
+    acquire_lock 30 || return 1
+    if ! { [ -x /opt/sbin/ipset ] || command -v ipset >/dev/null 2>&1; }; then
+        warn "ipset unavailable - skipping firewall apply"
+        release_lock
+        return 1
+    fi
+    policy_mark="$(wait_policy_mark 120)"
+    [ -n "$policy_mark" ] || { warn "Keenetic policy '$POLICY_DESCRIPTION' not found"; release_lock; return 1; }
+
+    load_tproxy_module
+    setup_bypass_set
+    if ! "$(command -v ipset 2>/dev/null || echo /opt/sbin/ipset)" list -n 2>/dev/null | grep -qx "$BYPASS_SET"; then
+        warn "bypass set $BYPASS_SET missing - skipping firewall apply"
+        release_lock
+        return 1
+    fi
+    setup_tproxy_route
+
+    clean_chain nat "$NAT_CHAIN" PREROUTING
+    clean_chain mangle "$MANGLE_CHAIN" PREROUTING
+
+    pcsv="$(ports_csv)"
+
+    iptables -w -t nat -N "$NAT_CHAIN"
+    iptables -w -t nat -A "$NAT_CHAIN" -m conntrack --ctstate DNAT -j RETURN
+    iptables -w -t nat -A "$NAT_CHAIN" -m set --match-set "$BYPASS_SET" dst -j RETURN
+    [ -n "$pcsv" ] && iptables -w -t nat -A "$NAT_CHAIN" -p tcp -m multiport --dports "$pcsv" -j RETURN
+    iptables -w -t nat -A "$NAT_CHAIN" -p tcp -j REDIRECT --to-ports "$REDIRECT_PORT"
+    iptables -w -t nat -A PREROUTING -m connmark --mark "$policy_mark" -m conntrack ! --ctstate INVALID -j "$NAT_CHAIN"
+
+    iptables -w -t mangle -N "$MANGLE_CHAIN"
+    iptables -w -t mangle -A "$MANGLE_CHAIN" -m conntrack --ctstate DNAT -j RETURN
+    iptables -w -t mangle -A "$MANGLE_CHAIN" -m set --match-set "$BYPASS_SET" dst -j RETURN
+    [ -n "$pcsv" ] && iptables -w -t mangle -A "$MANGLE_CHAIN" -p udp -m multiport --dports "$pcsv" -j RETURN
+    iptables -w -t mangle -A "$MANGLE_CHAIN" -p udp -j MARK --set-xmark "$TPROXY_MARK/0xffffffff"
+    iptables -w -t mangle -A "$MANGLE_CHAIN" -p udp -j CONNMARK --save-mark --nfmask 0xffffffff --ctmask 0xffffffff
+    iptables -w -t mangle -A "$MANGLE_CHAIN" -p udp -j TPROXY --on-ip 127.0.0.1 --on-port "$TPROXY_PORT" --tproxy-mark "$TPROXY_MARK/0xffffffff"
+    iptables -w -t mangle -A PREROUTING -m connmark --mark "$policy_mark" -m conntrack ! --ctstate INVALID -j "$MANGLE_CHAIN"
+    release_lock
+}
+
+start_service() {
+    create_hook
+    wait_sui_ports 120 || warn "continuing without confirmed s-ui listener"
+    apply_rules || return 1
+    create_hook
+    log "started for policy '$POLICY_DESCRIPTION'"
+}
+
+stop_service() {
+    rm -f "$HOOK"
+    clean_rules
+    rm -rf "$LOCK_DIR" "$SCHEDULE_LOCK_DIR" 2>/dev/null || true
+    log "stopped"
+}
+
+status_service() {
+    policy_mark="$(get_policy_mark)"
+    printf 'policy=%s mark=%s redirect=%s tproxy=%s fwmark=%s table=%s\n' "$POLICY_DESCRIPTION" "${policy_mark:-missing}" "$REDIRECT_PORT" "$TPROXY_PORT" "$TPROXY_MARK" "$TPROXY_TABLE"
+    ipset list "$BYPASS_SET" >/dev/null 2>&1 && printf 'ipset=%s present\n' "$BYPASS_SET" || printf 'ipset=%s missing\n' "$BYPASS_SET"
+    iptables -t nat -nL "$NAT_CHAIN" >/dev/null 2>&1 && printf 'nat_chain=%s present\n' "$NAT_CHAIN" || printf 'nat_chain=%s missing\n' "$NAT_CHAIN"
+    iptables -t mangle -nL "$MANGLE_CHAIN" >/dev/null 2>&1 && printf 'mangle_chain=%s present\n' "$MANGLE_CHAIN" || printf 'mangle_chain=%s missing\n' "$MANGLE_CHAIN"
+    ip -4 rule show | awk -v m="$TPROXY_MARK" -v t="$TPROXY_TABLE" '$0 ~ ("fwmark " m) && $0 ~ ("lookup " t) { print }'
+}
+
+case "${1:-start}" in
+    start) start_service ;;
+    stop) stop_service ;;
+    restart|reconfigure) stop_service; start_service ;;
+    apply|firewall) apply_rules ;;
+    schedule) schedule_apply ;;
+    status|check) status_service ;;
+    version|--version) echo "sui-tproxy $VERSION" ;;
+    *) echo "Usage: $0 {start|stop|restart|reconfigure|apply|schedule|status|version}" >&2; exit 2 ;;
+esac

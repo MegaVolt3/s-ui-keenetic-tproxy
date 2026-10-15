@@ -1,0 +1,29 @@
+#!/bin/sh
+# Entware init script (S99): applies the s-ui TProxy/REDIRECT glue at boot,
+# after s-ui itself has been started by its own S90 script.
+#
+# Part of s-ui-keenetic-tproxy. Runs /opt/sbin/sui-tproxy, logging to
+# /opt/var/log/sui-tproxy-init.log.
+PATH=/opt/sbin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+LOG=/opt/var/log/sui-tproxy-init.log
+
+mkdir -p /opt/var/log
+
+case "${1:-start}" in
+    start)
+        /opt/sbin/sui-tproxy start >>"$LOG" 2>&1
+        ;;
+    stop)
+        /opt/sbin/sui-tproxy stop >>"$LOG" 2>&1
+        ;;
+    restart|reconfigure)
+        /opt/sbin/sui-tproxy restart >>"$LOG" 2>&1
+        ;;
+    status|check)
+        /opt/sbin/sui-tproxy status
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|reconfigure|status}" >&2
+        exit 2
+        ;;
+esac

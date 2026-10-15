@@ -1,0 +1,24 @@
+#!/bin/sh
+# EXAMPLE ONLY -- do not edit in place.
+#
+# This hook is generated automatically by `sui-tproxy start` / `apply`:
+# /opt/sbin/sui-tproxy create_hook writes /opt/etc/ndm/netfilter.d/sui-tproxy.sh
+# with the current policy mark baked in.
+#
+# Keenetic's NDM rebuilds its iptables chains on interface/policy events and on
+# boot; every script in /opt/etc/ndm/netfilter.d/ is executed by NDM for each
+# (type, table) pair it configures. This hook is what makes the s-ui rules
+# survive that rebuild: NDM calls it, and it re-applies our chains (debounced by
+# the "schedule" action, which retries with growing delays).
+#
+# Kept in the repository for documentation; use it only if you need to install a
+# fixed mark by hand.
+
+[ "$type" = "iptables" ] || exit 0
+[ "$table" = "nat" ] || [ "$table" = "mangle" ] || exit 0
+
+# Optional: pin the policy mark (hex, no 0x prefix needed).
+POLICY_MARK="0xffffaac"
+export POLICY_MARK
+
+/opt/sbin/sui-tproxy schedule
